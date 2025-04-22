@@ -1,0 +1,845 @@
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { 
+  Loader2, 
+  ArrowLeft, 
+  Save, 
+  AlertCircle, 
+  Filter, 
+  SlidersHorizontal,
+  ChevronLeft,
+  ChevronRight,
+  Home,
+  FileText,
+  Search,
+  Settings,
+  Bug,
+  ArrowBigUp
+} from 'lucide-react';
+import { DocumentViewer2 } from '../document-viewer2';
+import { Button } from '../ui/button';
+import { Input } from '../ui/input';
+import { Checkbox } from '../ui/checkbox';
+import { getDocument, getConfig, getDocumentPage, getDocumentPages } from '../../lib/api';
+import { Exception, Config, configSchema } from '../../lib/types';
+import { cn } from '../../lib/utils';
+
+function ImageExcerpt({ 
+  imageUrl, 
+  boundingBox,
+  className,
+  style,
+  position = 'top',
+  message,
+}: { 
+  imageUrl: string | null;
+  boundingBox: {
+    top: number;
+    left: number;
+    bottom: number;
+    right: number;
+  } | null;
+  className?: string;
+  style?: React.CSSProperties;
+  position?: 'top' | 'bottom';
+  message?: string;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    if (!imageUrl || !boundingBox || !canvasRef.current) {
+      if (message && canvasRef.current) {
+        const canvas = canvasRef.current;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+
+        canvas.width = 300;
+        canvas.height = 150;
+
+        ctx.fillStyle = '#f3f4f6';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        ctx.fillStyle = '#6b7280';
+        ctx.font = '14px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(message, canvas.width / 2, canvas.height / 2);
+      }
+      return;
+    }
+
+    const img = new Image();
+    img.src = imageUrl;
+    img.onload = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const contextPadding = 40;
+      const x = (boundingBox.left / 100) * img.width;
+      const y = (boundingBox.top / 100) * img.height;
+      const width = ((boundingBox.right - boundingBox.left) / 100) * img.width;
+      const height = ((boundingBox.bottom - boundingBox.top) / 100) * img.height;
+
+      canvas.width = 300;
+      canvas.height = 150;
+
+      ctx.fillStyle = '#f3f4f6';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const sourceX = Math.max(0, x - contextPadding);
+      const sourceY = Math.max(0, y - contextPadding);
+      const sourceWidth = width + (contextPadding * 2);
+      const sourceHeight = height + (contextPadding * 2);
+
+      ctx.drawImage(
+        img,
+        sourceX, sourceY, sourceWidth, sourceHeight,
+        0, 0, canvas.width, canvas.height
+      );
+
+      const scale = {
+        x: canvas.width / sourceWidth,
+        y: canvas.height / sourceHeight
+      };
+
+      const highlightX = (contextPadding) * scale.x;
+      const highlightY = (contextPadding) * scale.y;
+      const highlightWidth = width * scale.x;
+      const highlightHeight = height * scale.y;
+
+      ctx.strokeStyle = '#3b82f6';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(
+        highlightX,
+        highlightY,
+        highlightWidth,
+        highlightHeight
+      );
+    };
+  }, [imageUrl, boundingBox, message]);
+
+  return (
+    <div 
+      className={cn(
+        "fixed z-[1000] bg-white rounded-lg shadow-lg",
+        "animate-in fade-in zoom-in-95 duration-200",
+        position === 'top' && "origin-bottom",
+        position === 'bottom' && "origin-top",
+        className
+      )}
+      style={style}
+    >
+      <canvas
+        ref={canvasRef}
+        className="rounded-lg"
+      />
+    </div>
+  );
+}
+
+function SliderThumb({ value }: { value: number }) {
+  return (
+    <div 
+      className="absolute pointer-events-none"
+      style={{
+        left: `${value}%`,
+        transform: 'translateX(-50%)'
+      }}
+    >
+      <div className="flex flex-col items-center">
+        <div className="relative">
+          <div className="bg-primary-600 text-white text-xs rounded-md px-2 py-1">
+            {value}%
+          </div>
+          <div className="absolute left-1/2 -translate-x-1/2 bottom-[-4px] w-0 h-0 border-l-[4px] border-l-transparent border-r-[4px] border-r-transparent border-t-[4px] border-t-primary-600" />
+        </div>
+        <div className="relative -mt-[2px]">
+          <ArrowBigUp 
+            className="h-5 w-5 text-primary-600"
+            strokeWidth={2.5}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function ExtractionReview2() {
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const [document, setDocument] = useState<Exception | null>(null);
+  const [config, setConfig] = useState<Config | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedField, setSelectedField] = useState<string | null>(null);
+  const [pageUrl, setPageUrl] = useState<string | null>(null);
+  const [confidenceThreshold, setConfidenceThreshold] = useState(0);
+  const [showLowConfidenceOnly, setShowLowConfidenceOnly] = useState(false);
+  const [isPanelOpen, setIsPanelOpen] = useState(true);
+  const [panelWidth, setPanelWidth] = useState(400);
+  const [isResizing, setIsResizing] = useState(false);
+  const [isToolbarExpanded, setIsToolbarExpanded] = useState(false);
+  const [viewerKey, setViewerKey] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [showDebug, setShowDebug] = useState(false);
+  const [previewPosition, setPreviewPosition] = useState<{
+    top: number;
+    left: number;
+    position: 'top' | 'bottom';
+  } | null>(null);
+  const tableRef = useRef<HTMLTableElement>(null);
+  const extractionContainerRef = useRef<HTMLDivElement>(null);
+  const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const rowRefs = useRef<Record<string, HTMLTableRowElement | null>>({});
+
+  const docId = searchParams.get('doc_id');
+
+  useEffect(() => {
+    async function loadData() {
+      try {
+        if (!docId) {
+          setError('No document identifier provided');
+          setLoading(false);
+          return;
+        }
+
+        const [docData, configData, pages] = await Promise.all([
+          getDocument(docId),
+          getConfig(),
+          getDocumentPages(docId)
+        ]);
+
+        const pageBlob = await getDocumentPage(docId, 1);
+        const url = URL.createObjectURL(pageBlob);
+        setPageUrl(url);
+        setTotalPages(pages);
+
+        setDocument(docData);
+        const parsedConfig = configSchema.parse(configData);
+        setConfig(parsedConfig);
+
+        const extractionConfig = parsedConfig.workflow_steps?.find(step => step.name === 'extraction');
+        if (extractionConfig?.threshold) {
+          setConfidenceThreshold(extractionConfig.threshold);
+        }
+      } catch (err) {
+        console.error('Failed to load data:', err);
+        setError('Failed to load document data');
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    loadData();
+
+    return () => {
+      if (pageUrl) {
+        URL.revokeObjectURL(pageUrl);
+      }
+    };
+  }, [docId]);
+
+  useEffect(() => {
+    async function loadPage() {
+      if (!docId) return;
+
+      try {
+        if (pageUrl) {
+          URL.revokeObjectURL(pageUrl);
+        }
+
+        const pageBlob = await getDocumentPage(docId, currentPage);
+        const url = URL.createObjectURL(pageBlob);
+        setPageUrl(url);
+      } catch (err) {
+        console.error('Failed to load page:', err);
+      }
+    }
+
+    loadPage();
+  }, [docId, currentPage]);
+
+  useEffect(() => {
+    if (!isResizing) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      const newWidth = window.innerWidth - e.clientX;
+      const maxWidth = Math.floor(window.innerWidth * 0.5);
+      const constrainedWidth = Math.min(Math.max(newWidth, 300), maxWidth);
+      setPanelWidth(constrainedWidth);
+    };
+
+    const handleMouseUp = () => {
+      setIsResizing(false);
+      setViewerKey(prev => prev + 1);
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isResizing]);
+
+  const handleFieldFocus = async (index: number, event: React.FocusEvent<HTMLElement>) => {
+    const field = document?.metadata?.extracted_data?.[index];
+    if (!field) return;
+
+    setSelectedField(index.toString());
+
+    const pageNumber = field.value?.boundingRegions?.[0]?.pageNumber || 
+                      field.key?.boundingRegions?.[0]?.pageNumber || 
+                      currentPage;
+
+    if (pageNumber !== currentPage) {
+      setPreviewPosition(null);
+      setCurrentPage(pageNumber);
+      
+      if (docId) {
+        try {
+          const pageBlob = await getDocumentPage(docId, pageNumber);
+          const url = URL.createObjectURL(pageBlob);
+          setPageUrl(url);
+        } catch (err) {
+          console.error('Failed to load page:', err);
+        }
+      }
+    }
+
+    const row = rowRefs.current[index.toString()];
+    if (!row) return;
+
+    const rowRect = row.getBoundingClientRect();
+    const containerRect = extractionContainerRef.current?.getBoundingClientRect();
+    
+    if (!containerRect) return;
+
+    const previewHeight = 150;
+    const padding = 4;
+
+    const hasValue = field.value?.content && field.value.content !== '';
+    const useKeyBoundingBox = !hasValue && field.key?.boundingRegions?.[0]?.percentage_coords;
+
+    if (!field.value?.boundingRegions?.[0]?.percentage_coords && !useKeyBoundingBox) {
+      setPreviewPosition({ 
+        top: rowRect.top - previewHeight - padding, 
+        left: rowRect.left,
+        position: 'top'
+      });
+      return;
+    }
+
+    row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+    setPreviewPosition({ 
+      top: rowRect.top - previewHeight - padding, 
+      left: rowRect.left,
+      position: 'top'
+    });
+  };
+
+  const handleFieldBlur = () => {
+    setSelectedField(null);
+    setPreviewPosition(null);
+  };
+
+  const handleFieldUpdate = (index: number, newValue: string | boolean) => {
+    if (!document?.metadata?.extracted_data) return;
+    
+    const updatedData = [...document.metadata.extracted_data];
+    const currentField = updatedData[index];
+    
+    if (typeof currentField.value?.content === 'string' && 
+        (currentField.value.content.includes(':selected:') || 
+         currentField.value.content.includes(':unselected:'))) {
+      const newContent = typeof newValue === 'boolean' 
+        ? (newValue ? ':selected:' : ':unselected:')
+        : newValue;
+      
+      updatedData[index] = {
+        ...currentField,
+        value: { 
+          ...currentField.value,
+          content: newContent
+        }
+      };
+    } else {
+      updatedData[index] = {
+        ...currentField,
+        value: { 
+          ...currentField.value,
+          content: newValue as string
+        }
+      };
+    }
+    
+    setDocument(prev => prev ? {
+      ...prev,
+      metadata: {
+        ...prev.metadata,
+        extracted_data: updatedData
+      }
+    } : null);
+  };
+
+  const handleSave = async () => {
+    console.log('Saving updated fields:', document?.metadata?.extracted_data);
+  };
+
+  const handleFieldSelect = (index: number) => {
+    setSelectedField(prev => {
+      const newValue = prev === index.toString() ? null : index.toString();
+      
+      if (newValue !== null) {
+        const input = inputRefs.current[newValue];
+        if (input) {
+          setTimeout(() => {
+            input.focus();
+            input.select();
+          }, 0);
+        }
+      }
+      
+      return newValue;
+    });
+  };
+
+  const filteredFields = useMemo(() => {
+    if (!document?.metadata?.extracted_data) return [];
+  
+    const filteredIndices = new Set(
+      document.metadata.extracted_data
+        .map((field, index) => ({ field, index }))
+        .filter(({ field }) => {
+          if (showLowConfidenceOnly) {
+            return field.confidence < 0.9;
+          }
+          return field.confidence <= confidenceThreshold;
+        })
+        .map(({ index }) => index.toString())
+    );
+
+    return document.metadata.extracted_data
+      .map((field, index) => ({ field, index }))
+      .filter(({ index }) => filteredIndices.has(index.toString()));
+  }, [document?.metadata?.extracted_data, showLowConfidenceOnly, confidenceThreshold]);
+
+  const boundingBoxes = useMemo(() => {
+    return filteredFields.map(({ field, index }) => {
+      if (!field?.value?.boundingRegions?.[0]?.percentage_coords) {
+        return {
+          id: index.toString(),
+          box: {
+            page: 1,
+            top: 0,
+            left: 0,
+            bottom: 0,
+            right: 0
+          },
+          confidence: field.confidence || 0,
+          isActive: index.toString() === selectedField
+        };
+      }
+
+      const region = field.value.boundingRegions[0];
+      const coords = region.percentage_coords;
+      
+      return {
+        id: index.toString(),
+        box: {
+          page: region.pageNumber || 1,
+          top: coords.top_left?.[1] || 0,
+          left: coords.top_left?.[0] || 0,
+          bottom: coords.bottom_right?.[1] || 0,
+          right: coords.bottom_right?.[0] || 0
+        },
+        confidence: field.confidence || 0,
+        isActive: index.toString() === selectedField
+      };
+    });
+  }, [filteredFields, selectedField]);
+
+  const currentFieldBox = useMemo(() => {
+    if (!selectedField || !document?.metadata?.extracted_data) return null;
+    
+    const field = document.metadata.extracted_data[parseInt(selectedField)];
+    if (!field) return null;
+
+    const hasValue = field.value?.content && field.value.content !== '';
+    
+    if (hasValue && field?.value?.boundingRegions?.[0]?.percentage_coords) {
+      const coords = field.value.boundingRegions[0].percentage_coords;
+      return {
+        top: coords.top_left?.[1] || 0,
+        left: coords.top_left?.[0] || 0,
+        bottom: coords.bottom_right?.[1] || 0,
+        right: coords.bottom_right?.[0] || 0
+      };
+    }
+    
+    if (field?.key?.boundingRegions?.[0]?.percentage_coords) {
+      const coords = field.key.boundingRegions[0].percentage_coords;
+      return {
+        top: coords.top_left?.[1] || 0,
+        left: coords.top_left?.[0] || 0,
+        bottom: coords.bottom_right?.[1] || 0,
+        right: coords.bottom_right?.[0] || 0
+      };
+    }
+
+    return null;
+  }, [selectedField, document?.metadata?.extracted_data]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <Loader2 className="h-8 w-8 animate-spin text-primary-600" />
+      </div>
+    );
+  }
+
+  if (error || !document || !config || !pageUrl) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="text-accent-600">{error || 'Document not found'}</div>
+      </div>
+    );
+  }
+
+  const getConfidenceColor = (confidence: number) => {
+    if (confidence >= 0.9) return 'text-green-600 bg-green-50';
+    if (confidence >= 0.8) return 'text-yellow-600 bg-yellow-50';
+    return 'text-accent-600 bg-accent-50';
+  };
+
+  return (
+    <div id="mainContainer" className="fixed inset-0">
+      <div id="topBar" className="fixed top-0 left-0 right-0 bg-[#eef5ff] shadow-sm z-50 h-12">
+        <div className="flex items-center justify-between h-full px-4">
+          <div className="flex items-center space-x-4">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => navigate('/dashboard')}
+            >
+              <ArrowLeft className="h-4 w-4 mr-2" />
+              Back to Queue
+            </Button>
+            <h1 className="text-lg font-semibold text-gray-900">
+              Document Extraction Review
+            </h1>
+          </div>
+          <div className="flex items-center space-x-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowDebug(!showDebug)}
+              className={cn(showDebug && 'bg-yellow-50')}
+            >
+              <Bug className="h-4 w-4 mr-2" />
+              Debug
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowLowConfidenceOnly(!showLowConfidenceOnly)}
+              className={cn(showLowConfidenceOnly && 'bg-primary-50')}
+            >
+              <Filter className="h-4 w-4 mr-2" />
+              {showLowConfidenceOnly ? 'Show All' : 'Low Confidence Only'}
+            </Button>
+            <Button onClick={handleSave}>
+              <Save className="h-4 w-4 mr-2" />
+              Save Changes
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      <div
+        id="leftToolbar"
+        className={cn(
+          "fixed left-0 top-12 bottom-0 bg-[#003366] shadow-lg transition-all duration-300 z-40",
+          isToolbarExpanded ? "w-48" : "w-12"
+        )}
+      >
+        <button
+          id="leftToolbarToggle"
+          onClick={() => setIsToolbarExpanded(!isToolbarExpanded)}
+          className="absolute -right-[18px] top-1/2 -translate-y-1/2 bg-white rounded-r shadow-md hover:bg-gray-50 w-[18px] h-16 flex items-center justify-center border border-l-0"
+          title={isToolbarExpanded ? "Collapse menu" : "Expand menu"}
+        >
+          {isToolbarExpanded ? (
+            <ChevronLeft className="h-4 w-4" />
+          ) : (
+            <ChevronRight className="h-4 w-4" />
+          )}
+        </button>
+
+        <div className="flex flex-col space-y-1 w-full pt-2">
+          {[
+            { icon: Home, label: 'Home', onClick: () => navigate('/dashboard') },
+            { icon: FileText, label: 'Documents', onClick: () => {} },
+            { icon: Search, label: 'Search', onClick: () => {} },
+            { icon: Settings, label: 'Settings', onClick: () => navigate('/admin') }
+          ].map((item, index) => {
+            const Icon = item.icon;
+            return (
+              <button
+                key={index}
+                onClick={item.onClick}
+                className={cn(
+                  "flex items-center px-3 py-2 text-[#b3c7e6] hover:bg-[#004480] transition-colors",
+                  "focus:outline-none focus:bg-[#004480]"
+                )}
+              >
+                <Icon className="h-5 w-5 flex-shrink-0" />
+                <span
+                  className={cn(
+                    "ml-3 text-sm whitespace-nowrap transition-all duration-300",
+                    isToolbarExpanded ? "opacity-100" : "opacity-0 w-0 overflow-hidden"
+                  )}
+                >
+                  {item.label}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div 
+        id="mainContent"
+        className="fixed top-12 bottom-0 left-12 right-0 bg-gray-100 z-10"
+        style={{
+          right: isPanelOpen ? `${panelWidth}px` : '0',
+        }}
+      >
+        <DocumentViewer2
+          key={viewerKey}
+          imageUrl={pageUrl}
+          boundingBoxes={boundingBoxes}
+          onBoundingBoxClick={handleFieldSelect}
+          className="h-full"
+          isPanelOpen={isPanelOpen}
+          isToolbarExpanded={isToolbarExpanded}
+          currentPage={currentPage}
+          totalPages={totalPages}
+          onPageChange={setCurrentPage}
+        />
+      </div>
+
+      {selectedField && previewPosition && (
+        <ImageExcerpt
+          imageUrl={pageUrl}
+          boundingBox={currentFieldBox}
+          style={{
+            top: previewPosition.top,
+            left: previewPosition.left,
+          }}
+          position={previewPosition.position}
+          message={!currentFieldBox ? "No bounding box available" : undefined}
+        />
+      )}
+
+      <div 
+        id="rightExtractionPanel"
+        style={{ 
+          width: panelWidth,
+          minWidth: `${panelWidth}px`,
+          maxWidth: `${panelWidth}px`,
+        }}
+        className={cn(
+          "fixed right-0 top-12 bottom-0 bg-white shadow-lg z-30 transition-transform",
+          isPanelOpen ? "translate-x-0" : "translate-x-full"
+        )}
+      >
+        <div
+          id="rightPanelResizeHandle"
+          className="absolute left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary-500 group"
+          onMouseDown={() => setIsResizing(true)}
+        >
+          <div className="absolute inset-y-0 -left-2 right-0 group-hover:bg-primary-500/10" />
+        </div>
+
+        <button
+          id="rightPanelToggle"
+          onClick={() => setIsPanelOpen(!isPanelOpen)}
+          className="absolute -left-[18px] top-1/2 -translate-y-1/2 bg-white rounded-l shadow-md hover:bg-gray-50 w-[18px] h-16 flex items-center justify-center border border-r-0"
+          title={isPanelOpen ? "Collapse panel" : "Expand panel"}
+        >
+          {isPanelOpen ? (
+            <ChevronRight className="h-4 w-4" />
+          ) : (
+            <ChevronLeft className="h-4 w-4" />
+          )}
+        </button>
+
+        <div id="extractionPanelContainer" className="h-full flex flex-col">
+          <div id="extractionPanelHeader" className="p-4 border-b">
+            <h2 className="text-lg font-medium text-gray-900">
+              Field Validation
+            </h2>
+            <p className="mt-1 text-sm text-gray-500">
+              Review and correct extracted field values
+            </p>
+          </div>
+
+          <div id="confidenceFilterSection" className="p-4 border-b bg-gray-50">
+            <div className="flex items-center justify-between mb-8">
+              <span className="text-sm font-medium text-gray-700">
+                Confidence Filter
+              </span>
+              <SlidersHorizontal className="h-4 w-4 text-gray-400" />
+            </div>
+            <div className="relative">
+              <div className="relative h-2">
+                <div className="absolute inset-0 rounded-lg bg-gray-200" />
+                <div 
+                  className="absolute inset-y-0 left-0 rounded-lg bg-primary-600"
+                  style={{ width: `${confidenceThreshold * 100}%` }}
+                />
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={confidenceThreshold * 100}
+                  onChange={(e) => setConfidenceThreshold(parseInt(e.target.value) / 100)}
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                />
+                <SliderThumb value={Math.round(confidenceThreshold * 100)} />
+              </div>
+            </div>
+            <div className="flex justify-between text-xs text-gray-500 mt-6">
+              <span>0%</span>
+              <span>50%</span>
+              <span>100%</span>
+            </div>
+          </div>
+
+          <div 
+            id="extractionFieldsContainer" 
+            ref={extractionContainerRef}
+            className="overflow-auto flex-1"
+          >
+            <table 
+              ref={tableRef}
+              id="extractionFieldsTable" 
+              className="min-w-full divide-y divide-gray-200"
+            >
+              <thead className="bg-gray-50">
+                <tr>
+                  <th scope="col" className="w-[40%] px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Field
+                  </th>
+                  <th scope="col" className="w-[45%] px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Value
+                  </th>
+                  <th scope="col" className="w-[15%] px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Confidence
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {filteredFields.map(({ field, index }) => {
+                  const content = typeof field.value?.content === 'string' 
+                    ? field.value.content 
+                    : '';
+                  
+                  const keyContent = typeof field.key === 'object' && field.key !== null
+                    ? field.key.content || 'Unnamed Field'
+                    : field.key || 'Unnamed Field';
+                  
+                  const isCheckbox = content.includes(':selected:') || content.includes(':unselected:');
+                  const isChecked = content.includes(':selected:');
+                  
+                  return (
+                    <tr
+                      key={index}
+                      ref={(el) => rowRefs.current[index.toString()] = el}
+                      className={cn(
+                        'hover:bg-gray-50 cursor-pointer',
+                        selectedField === index.toString() && 'bg-primary-50'
+                      )}
+                      onClick={(e) => handleFieldFocus(index, e)}
+                    >
+                      <td className="px-4 py-3 text-xs font-medium text-gray-900 align-top">
+                        <div className="break-words">{keyContent}</div>
+                      </td>
+                      <td className="px-4 py-3 text-sm text-gray-500">
+                        {isCheckbox ? (
+                          <div className="flex items-center h-8 px-3">
+                            <Checkbox
+                              checked={isChecked}
+                              onCheckedChange={(checked) => handleFieldUpdate(index, checked)}
+                              onFocus={(e) => handleFieldFocus(index, e)}
+                              onBlur={handleFieldBlur}
+                              onClick={(e) => e.stopPropagation()}
+                            />
+                          </div>
+                        ) : (
+                          <div className="relative">
+                            <Input
+                              ref={(el) => inputRefs.current[index.toString()] = el}
+                              value={content}
+                              onChange={(e) => handleFieldUpdate(index, e.target.value)}
+                              onFocus={(e) => handleFieldFocus(index, e)}
+                              onBlur={handleFieldBlur}
+                              placeholder="No value"
+                              className={cn(
+                                "h-8",
+                                !content && "text-gray-400 placeholder:text-gray-400"
+                              )}
+                              onClick={(e) => e.stopPropagation()}
+                            />
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-sm align-top">
+                        <div className="flex items-center">
+                          <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                            getConfidenceColor(field.confidence || 0)
+                          }`}>
+                            {Math.round((field.confidence || 0) * 100)}%
+                          </span>
+                          {(field.confidence || 0) < 0.9 && (
+                            <AlertCircle className="h-4 w-4 ml-2 text-yellow-500" />
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      {showDebug && (
+        <div 
+          className="fixed top-14 right-4 bg-black/90 text-white p-4 rounded-lg shadow-lg z-[1000] font-mono text-sm"
+          style={{ maxWidth: '400px' }}
+        >
+          <h3 className="font-bold mb-2 flex items-center">
+            <Bug className="h-4 w-4 mr-2" />
+            Data Debug
+          </h3>
+          <div className="space-y-1">
+            <div>Total Fields: {document.metadata?.extracted_data?.length || 0}</div>
+            <div>Filtered Fields: {filteredFields.length}</div>
+            <div>Current Page: {currentPage}</div>
+            <div>Total Pages: {totalPages}</div>
+            <div>Confidence Threshold: {Math.round(confidenceThreshold * 100)}%</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
